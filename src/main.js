@@ -1,9 +1,9 @@
 import Logger from 'js-logger'
-import SparkMD5 from 'spark-md5'
 import config from './config'
 import EventEmitter from './eventEmitter'
 import * as Util from './util'
 import * as Type from './type'
+import {urlSafeBase64Encode} from './base64'
 
 Logger.useDefaults({
   defaultLevel: Logger.OFF,
@@ -17,22 +17,26 @@ Logger.useDefaults({
 
 const fileManager = wx.getFileSystemManager()
 const readFileAsync = Util.promisify(fileManager.readFile)
-const miniProgram = wx.getAccountInfoSync()
 const systemInfo = wx.getSystemInfoSync()
-const appId = miniProgram.appId
-const MB = 1024 * 1024
+
+// 清理过期的缓存
+Util.clearExpiredLocalFileInfo()
 
 class Uploader {
   constructor(option = {}) {
-    if (option.verbose) Logger.setLevel(Logger.INFO)
+    // if (option.verbose) Logger.setLevel(Logger.INFO)
+    if (option.verbose) Logger.setLevel(Logger.TRACE)
     Logger.debug('construct option ', option)
-    this.config = Object.assign(config, option)
+    // this.config = Object.assign(config, option)
+    this.config = {...config, ...option}
     this.emitter = new EventEmitter()
     this.totalSize = this.config.totalSize
     this.chunkSize = this.config.chunkSize
+    this.continueByMD5 = this.config.continueByMD5
     this.tempFilePath = this.config.tempFilePath
     this.totalChunks = Math.ceil(this.totalSize / this.chunkSize)
     this.maxLoadChunks = Math.floor(this.config.maxMemory / this.chunkSize)
+    this.isDirectUpload = this.config.forceDirect || this.totalSize < this.config.directChunkSize // 直传：强制直传或者文件大小小于分片大小
     this._event()
   }
 
@@ -44,73 +48,6 @@ class Uploader {
   async upload() {
     this._reset()
 
-    Logger.info('start generateIdentifier')
-    // step1: 计算 identifier
-    try {
-      Logger.time('[Uploader] generateIdentifier')
-      if (this.config.testChunks) {
-        this.identifier = await this.computeMD5()
-      } else {
-        this.identifier = this.generateIdentifier()
-      }
-      Logger.timeEnd('[Uploader] generateIdentifier')
-      Logger.debug('generateIdentifier ', this.identifier)
-    } catch (error) {
-      this.handleFail({
-        errCode: 10002,
-        errMsg: error.message
-      })
-      return
-    }
-    Logger.info('generateIdentifier end')
-    // step2: 获取已上传分片
-    if (this.config.testChunks && this.config.verifyUrl) {
-      Logger.info('start verify uploaded chunks')
-      Logger.time('[Uploader] verifyRequest')
-      const [verifyErr, verifyResp] = await Util.awaitWrap(this.verifyRequest())
-      Logger.timeEnd('[Uploader] verifyRequest')
-      Logger.debug('verifyRequest', verifyErr, verifyResp)
-      if (verifyErr) {
-        this.handleFail({
-          errCode: 20001,
-          errMsg: verifyErr.errMsg
-        })
-        return
-      }
-      const {
-        needUpload,
-        uploadedChunks,
-      } = verifyResp.data
-      Logger.info('verify uploaded chunks end')
-      // 秒传逻辑
-      // 找不到合成的文件
-      if (!needUpload) {
-        this.progress = 100
-        this.timeRemaining = 0
-        this.dispatchProgress()
-        this.emit('success', {
-          errCode: 0,
-          ...verifyResp.data
-        })
-        this.emit('complete', {
-          errCode: 0,
-          ...verifyResp.data
-        })
-        return
-      // 分片齐全，但没有合并
-      } else if (uploadedChunks.length === this.totalChunks) {
-        this.progress = 100
-        this.timeRemaining = 0
-        this.dispatchProgress()
-        this.emit('uploadDone')
-        return
-      } else {
-        this.chunksIndexNeedRead = this.chunksIndexNeedRead.filter(v => !uploadedChunks.includes(v))
-        this.chunksIndexNeedSend = this.chunksIndexNeedSend.filter(v => !uploadedChunks.includes(v))
-        this.uploadedChunks = uploadedChunks.sort()
-      }
-    }
-
     this.chunksNeedSend = this.chunksIndexNeedSend.length
     this.sizeNeedSend = this.chunksNeedSend * this.chunkSize
     if (this.chunksIndexNeedSend.includes(this.totalChunks - 1)) {
@@ -119,7 +56,6 @@ class Uploader {
 
     Logger.debug(`
       start upload
-        uploadedChunks: ${this.uploadedChunks},
         chunksQueue: ${this.chunksQueue},
         chunksIndexNeedRead: ${this.chunksIndexNeedRead},
         chunksNeedSend: ${this.chunksIndexNeedSend},
@@ -128,7 +64,7 @@ class Uploader {
 
     Logger.info('start upload chunks')
     Logger.time('[Uploader] uploadChunks')
-    // step3: 开始上传
+    // step1: 开始上传
     this.isUploading = true
     this._upload()
   }
@@ -138,7 +74,8 @@ class Uploader {
       chunkRetryInterval,
       maxChunkRetries,
       successStatus,
-      failStatus
+      failStatus,
+      timeout
     } = this.config
 
     let retries = maxChunkRetries
@@ -146,7 +83,7 @@ class Uploader {
       const doRequest = () => {
         const task = wx.request({
           ...args,
-          timeout: this.config.timeout,
+          timeout,
           success: (res) => {
             const statusCode = res.statusCode
 
@@ -193,7 +130,7 @@ class Uploader {
   }
 
   _event() {
-    // step4: 发送合并请求
+    // step2: 发送合并请求
     this.on('uploadDone', async () => {
       Logger.timeEnd('[Uploader] uploadChunks')
       Logger.info('upload chunks end')
@@ -204,10 +141,12 @@ class Uploader {
       Logger.timeEnd('[Uploader] mergeRequest')
       Logger.info('merge reqeust end')
       Logger.debug('mergeRequest', mergeErr, mergeResp)
+      if (this.continueByMD5) Util.removeLocalFileInfo(this.totalSize)
       if (mergeErr) {
         this.handleFail({
           errCode: 20003,
-          errrMsg: mergeErr.errMsg
+          errrMsg: mergeErr.errMsg,
+          errInfo: mergeErr
         })
         return
       }
@@ -221,11 +160,39 @@ class Uploader {
         ...mergeResp.data
       })
     })
+    // 直传：当文件大小小于分片大小
+    this.on('directUploadDone', async () => {
+      const [requestErr, request] = await Util.awaitWrap(this.directUpload())
+      this.updateUploadSize(this.totalSize)
+      if (requestErr) {
+        this.handleFail({
+          errCode: 20003,
+          errrMsg: requestErr.errMsg,
+          errInfo: requestErr
+        })
+        return
+      }
+      Logger.info('directUploadDone file success')
+      this.emit('success', {
+        errCode: 0,
+        ...request.data
+      })
+      this.emit('complete', {
+        errCode: 0,
+        ...request.data
+      })
+    })
   }
 
-  _upload() {
+  async _upload() {
     this.startUploadTime = Date.now()
     this._uploadedSize = 0
+
+    // 直传
+    if (this.isDirectUpload) {
+      this.emit('directUploadDone')
+      return
+    }
 
     if (this.chunksQueue.length) {
       const maxConcurrency = this.config.maxConcurrency
@@ -235,6 +202,54 @@ class Uploader {
     } else {
       this.readFileChunk()
     }
+  }
+
+  directUpload() {
+    const {
+      key, uphost, token, timeout, successStatus, failStatus, maxChunkRetries, chunkRetryInterval
+    } = this.config
+    let retries = maxChunkRetries
+    return new Promise((resolve, reject) => {
+      const doRequest = () => {
+        this.directTask = wx.uploadFile({
+          url: uphost,
+          filePath: this.tempFilePath,
+          name: 'file',
+          formData: {
+            key,
+            token
+          },
+          timeout,
+          success: (res) => {
+            console.log('uploadFile res', res, retries)
+            const statusCode = res.statusCode
+            // 标示成功的返回码
+            if (successStatus.includes(statusCode)) {
+              resolve(res)
+            // 标示失败的返回码
+            } else if (failStatus.includes(statusCode)) {
+              reject(res)
+            } else if (retries > 0) {
+              setTimeout(() => {
+                this.emit('retry', {
+                  statusCode,
+                  url: this.tempFilePath
+                })
+                --retries
+                doRequest()
+              }, chunkRetryInterval)
+            } else {
+              reject(res)
+            }
+          },
+          fail(error) {
+            reject(error)
+          }
+        })
+      }
+
+      doRequest()
+    })
   }
 
   updateUploadSize(currUploadSize) {
@@ -262,6 +277,12 @@ class Uploader {
   pause() {
     Logger.info('** pause **')
     this.isUploading = false
+
+    if (this.isDirectUpload) {
+      this.directTask.abort()
+      return
+    }
+
     const abortIndex = Object.keys(this.uploadTasks).map(v => v * 1)
     abortIndex.forEach(index => {
       this.chunksIndexNeedRead.push(index)
@@ -283,22 +304,22 @@ class Uploader {
   }
 
   _reset() {
+    // [0, 1, 2, 3, 4, 5, ...]，需要被读取的分片的序号数组
     this.chunksIndexNeedRead = Array.from(Array(this.totalChunks).keys())
     this.chunksIndexNeedSend = Array.from(Array(this.totalChunks).keys())
     this.chunksNeedSend = this.totalChunks
     this.sizeNeedSend = this.totalSize
-    this.identifier = ''
     this.chunksSend = 0
     this.chunksQueue = []
     this.uploadTasks = {}
-    this.pUploadList = []
-    this.uploadedChunks = []
     this.isUploading = false
     this.isFail = false
     this.progress = 0
     this.uploadedSize = 0
     this.averageSpeed = 0
     this.timeRemaining = Number.POSITIVE_INFINITY
+    this.ctxList = []
+    this.localInfo = this.continueByMD5 ? Util.getLocalFileInfo(this.totalSize) : null
     this.dispatchProgress()
   }
 
@@ -326,17 +347,25 @@ class Uploader {
         length
       }).then(res => {
         const chunk = res.data
+        let md5 = ''
+        if (this.continueByMD5) {
+          const t1 = Date.now()
+          md5 = Util.computeMd5(chunk)
+          console.log('time ' + index, Date.now() - t1)
+        }
         this.chunksQueue.push({
           chunk,
           length,
-          index
+          index,
+          md5
         })
         this.uploadChunk()
         return null
       }).catch(e => {
         this.handleFail({
           errCode: 10001,
-          errMsg: e.errMsg
+          errMsg: e.errMsg,
+          errInfo: e
         })
       })
     }
@@ -353,42 +382,52 @@ class Uploader {
     const {
       chunk,
       index,
-      length
+      length,
+      md5
     } = this.chunksQueue.shift()
 
-    // 跳过已发送的分块
-    if (this.uploadedChunks.includes(index)) {
-      this.uploadChunk()
-      return
+    if (this.continueByMD5) {
+      // 通过文件size作为id来缓存上传部分分片后失败的文件
+      // 如果缓存中存在该文件，并且对比md5发现某些分片已经上传，则不再重复上传该分片
+      const info = this.localInfo[index]
+      const savedReusable = info && !Util.isChunkExpired(info.time)
+      if (savedReusable && md5 === info.md5) {
+        this.ctxList[index] = {...info}
+        this.chunksSend++
+        this.updateUploadSize(length)
+        // 所有分片发送完毕
+        if (this.chunksSend === this.chunksNeedSend) {
+          this.emit('uploadDone')
+        } else {
+          // 尝试继续加载文件
+          this.readFileChunk()
+          // 尝试继续发送下一条
+          this.uploadChunk()
+        }
+        return
+      }
     }
-    const {
-      uploadUrl,
-      query,
-      header
-    } = this.config
-    const identifier = this.identifier
-    const url = Util.addParams(uploadUrl, {
-      ...query,
-      identifier,
-      index,
-      chunkSize: length,
-      fileName: this.config.fileName,
-      totalChunks: this.totalChunks,
-      totalSize: this.totalSize
-    })
+
     Logger.debug(`uploadChunk index: ${index}, lenght ${length}`)
     Logger.time(`[Uploader] uploadChunk index-${index}`)
+    const requestUrl = this.config.uphost + '/mkblk/' + length
     this._requestAsync({
-      url,
+      url: requestUrl,
       data: chunk,
       header: {
-        ...header,
+        ...Util.getAuthHeaders(this.config.token),
         'content-type': 'application/octet-stream'
       },
       method: 'POST',
     }, (task) => {
       this.uploadTasks[index] = task
-    }).then(() => {
+    }).then((res) => {
+      this.ctxList[index] = {
+        time: new Date().getTime(),
+        ctx: res.data.ctx,
+        size: length,
+        md5
+      }
       this.chunksSend++
       delete this.uploadTasks[index]
       this.updateUploadSize(length)
@@ -402,6 +441,7 @@ class Uploader {
       if (this.chunksSend === this.chunksNeedSend) {
         this.emit('uploadDone')
       }
+      if (this.continueByMD5) Util.setLocalFileInfo(this.totalSize, this.ctxList)
       return null
     }).catch(res => {
       if (res.errMsg.includes('request:fail abort')) {
@@ -409,7 +449,8 @@ class Uploader {
       } else {
         this.handleFail({
           errCode: 20002,
-          errMsg: res.errMsg
+          errMsg: res.errMsg,
+          errInfo: res
         })
       }
     })
@@ -427,87 +468,41 @@ class Uploader {
     this.emitter.off(event, listenr)
   }
 
-  generateIdentifier() {
-    let identifier = ''
-    const generator = this.config.generateIdentifier
-    if (Type.isFunction(generator)) {
-      identifier = generator()
-    } else {
-      const uuid = `${appId}-${Date.now()}-${Math.random()}`
-      identifier = SparkMD5.hash(uuid)
+  // 构造file上传url
+  createMkFileUrl() {
+    const {putExtra, key, uphost} = this.config
+    let requestUrl = uphost + '/mkfile/' + this.totalSize
+    if (key != null) {
+      requestUrl += '/key/' + urlSafeBase64Encode(key)
     }
-    return identifier
-  }
-
-  async computeMD5() {
-    const {
-      tempFilePath,
-      totalSize,
-      chunkSize
-    } = this
-
-    // 文件比内存限制小时，保存分片
-    const isltMaxMemory = totalSize < this.config.maxMemory
-    const sliceSize = isltMaxMemory ? chunkSize : 10 * MB
-    const sliceNum = Math.ceil(totalSize / sliceSize)
-    const spark = new SparkMD5.ArrayBuffer()
-    for (let i = 0; i < sliceNum; i++) {
-      const position = i * sliceSize
-      const length = Math.min(totalSize - position, sliceSize)
-      // eslint-disable-next-line no-await-in-loop
-      const [readFileErr, readFileResp] = await Util.awaitWrap(readFileAsync({
-        filePath: tempFilePath,
-        position,
-        length
-      }))
-
-      if (readFileErr) {
-        spark.destroy()
-        throw (new Error(readFileErr.errMsg))
-      }
-
-      const chunk = readFileResp.data
-      if (isltMaxMemory) {
-        this.chunksQueue.push({
-          chunk,
-          length,
-          index: i
-        })
-      }
-      spark.append(chunk)
+    // 由于没有file.type，因此不处理mimeType
+    // if (putExtra.mimeType) {
+    //   requestUrl += '/mimeType/' + urlSafeBase64Encode(file.type)
+    // }
+    const fname = putExtra.fname
+    if (fname) {
+      requestUrl += '/fname/' + urlSafeBase64Encode(fname)
     }
-    this.chunksIndexNeedRead = []
-    const identifier = spark.end()
-    spark.destroy()
-    return identifier
-  }
-
-  async verifyRequest() {
-    const {
-      verifyUrl,
-      fileName
-    } = this.config
-    const verifyResp = await this._requestAsync({
-      url: verifyUrl,
-      data: {
-        fileName,
-        identifier: this.identifier
-      }
-    })
-    return verifyResp
+    if (putExtra.params) {
+      Util.filterParams(putExtra.params).forEach(
+        item => (requestUrl += '/' + encodeURIComponent(item[0]) + '/' + urlSafeBase64Encode(item[1]))
+      )
+    }
+    return requestUrl
   }
 
   async mergeRequest() {
-    const {
-      mergeUrl,
-      fileName
-    } = this.config
+    const requestUrL = this.createMkFileUrl()
+    const data = this.ctxList.map(value => value.ctx).join(',')
+
     const mergeResp = await this._requestAsync({
-      url: mergeUrl,
-      data: {
-        fileName,
-        identifier: this.identifier
-      }
+      url: requestUrL,
+      header: {
+        ...Util.getAuthHeaders(this.config.token),
+        'content-type': 'text/plain'
+      },
+      data,
+      method: 'POST',
     })
     return mergeResp
   }

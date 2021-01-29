@@ -34,7 +34,7 @@ var logger = createCommonjsModule(function (module) {
 	var Logger = { };
 
 	// For those that are at home that are keeping score.
-	Logger.VERSION = "1.6.0";
+	Logger.VERSION = "1.6.1";
 
 	// Function which handles all incoming log messages.
 	var logHandler;
@@ -281,6 +281,9 @@ var logger = createCommonjsModule(function (module) {
 		Logger.setHandler(Logger.createDefaultHandler(options));
 	};
 
+	// Createa an alias to useDefaults to avoid reaking a react-hooks rule.
+	Logger.setDefaults = Logger.useDefaults;
+
 	// Export to popular environments boilerplate.
 	if ( module.exports) {
 		module.exports = Logger;
@@ -297,6 +300,59 @@ var logger = createCommonjsModule(function (module) {
 	}
 }(commonjsGlobal));
 });
+
+var config = {
+  tempFilePath: '',
+  totalSize: 0,
+  maxConcurrency: 3,
+  chunkSize: 4 * 1024 * 1024,
+  maxMemory: 100 * 1024 * 1024,
+  chunkRetryInterval: 0,
+  maxChunkRetries: 0,
+  timeout: 20000,
+  successStatus: [200, 201, 202],
+  failStatus: [404, 415, 500, 501],
+  verbose: false,
+  continueByMD5: true, // 断点续传：通过对比本地md5对失败文件的分片进行保存
+  forceDirect: false, // 强制直传
+  directChunkSize: 4 * 1024 * 1024, // 文件尺寸超过这个值就采用分片，否则直传
+};
+
+class EventEmitter {
+  constructor() {
+    this.events = {};
+  }
+
+  on(event, listener) {
+    if (typeof this.events[event] !== 'object') {
+      this.events[event] = [];
+    }
+    this.events[event].push(listener);
+    return () => this.off(event, listener)
+  }
+
+  off(event, listener) {
+    if (typeof this.events[event] === 'object') {
+      const idx = this.events[event].indexOf(listener);
+      if (idx > -1) {
+        this.events[event].splice(idx, 1);
+      }
+    }
+  }
+
+  emit(event, ...args) {
+    if (typeof this.events[event] === 'object') {
+      this.events[event].forEach(listener => listener.apply(this, args));
+    }
+  }
+
+  once(event, listener) {
+    const remove = this.on(event, (...args) => {
+      remove();
+      listener.apply(this, args);
+    });
+  }
+}
 
 var sparkMd5 = createCommonjsModule(function (module, exports) {
 (function (factory) {
@@ -1021,64 +1077,6 @@ var sparkMd5 = createCommonjsModule(function (module, exports) {
 }));
 });
 
-var config = {
-  tempFilePath: '',
-  totalSize: 0,
-  fileName: '',
-  verifyUrl: '',
-  uploadUrl: '',
-  mergeUrl: '',
-  maxConcurrency: 5,
-  generateIdentifier: null,
-  chunkSize: 5 * 1024 * 1024,
-  maxMemory: 100 * 1024 * 1024,
-  query: '',
-  header: {},
-  testChunks: false,
-  chunkRetryInterval: 0,
-  maxChunkRetries: 0,
-  timeout: 10000,
-  successStatus: [200, 201, 202],
-  failStatus: [404, 415, 500, 501],
-  verbose: false
-};
-
-class EventEmitter {
-  constructor() {
-    this.events = {};
-  }
-
-  on(event, listener) {
-    if (typeof this.events[event] !== 'object') {
-      this.events[event] = [];
-    }
-    this.events[event].push(listener);
-    return () => this.off(event, listener)
-  }
-
-  off(event, listener) {
-    if (typeof this.events[event] === 'object') {
-      const idx = this.events[event].indexOf(listener);
-      if (idx > -1) {
-        this.events[event].splice(idx, 1);
-      }
-    }
-  }
-
-  emit(event, ...args) {
-    if (typeof this.events[event] === 'object') {
-      this.events[event].forEach(listener => listener.apply(this, args));
-    }
-  }
-
-  once(event, listener) {
-    const remove = this.on(event, (...args) => {
-      remove();
-      listener.apply(this, args);
-    });
-  }
-}
-
 const isFunction = x => typeof x === 'function';
 
 function promisify(func) {
@@ -1091,12 +1089,6 @@ function promisify(func) {
       })
     );
   })
-}
-
-function addParams(url = '', params = {}) {
-  const parts = url.split('?');
-  const query = Object.keys(params).map(key => `${key}=${params[key]}`).join('&');
-  return query ? `${parts[0]}?${query}` : parts[0]
 }
 
 const awaitWrap = (promise) => promise
@@ -1129,6 +1121,293 @@ const compareVersion = (v1, v2) => {
   return 0
 };
 
+function filterParams(params) {
+  return Object.keys(params)
+    .filter(value => value.startsWith('x:'))
+    .map(k => [k, params[k].toString()])
+}
+
+function computeMd5(buffer) {
+  const spark = new sparkMd5.ArrayBuffer();
+  spark.append(buffer);
+  const md5 = spark.end();
+  spark.destroy();
+  return md5
+}
+
+function getAuthHeaders(token) {
+  const auth = 'UpToken ' + token;
+  return {Authorization: auth}
+}
+
+// 因为小程序缓存有上限，因此不能一直缓存
+const localKey = 'mini_js_sdk_upload_file';
+function setLocalFileInfo(size, info) {
+  try {
+    const data = wx.getStorageSync(localKey);
+    wx.setStorageSync(localKey, {
+      ...data,
+      [size]: info
+    });
+  } catch (err) {
+    console.warn('setLocalFileInfo failed', err);
+  }
+}
+
+function removeLocalFileInfo(size) {
+  try {
+    const data = wx.getStorageSync(localKey);
+    delete data[size];
+    wx.setStorageSync(localKey, data);
+  } catch (err) {
+    console.warn('removeLocalFileInfo failed', err);
+  }
+}
+
+function getLocalFileInfo(size) {
+  try {
+    return (wx.getStorageSync(localKey) || {})[size] || []
+  } catch (err) {
+    console.warn('getLocalFileInfo failed', err);
+    return []
+  }
+}
+
+function clearExpiredLocalFileInfo() {
+  try {
+    const data = wx.getStorageSync(localKey);
+    if (!data) return
+    const newData = {};
+    Object.keys(data).forEach(key => {
+      const info = data[key] || [];
+      const item = info.find(i => i && i.time);
+      if (item && !isChunkExpired(item.time)) {
+        newData[key] = info;
+      }
+    });
+    wx.setStorageSync(localKey, newData);
+  } catch (err) {
+    console.warn('getLocalFileInfo failed', err);
+  }
+}
+
+// 对上传块本地存储时间检验是否过期
+// TODO: 最好用服务器时间来做判断
+function isChunkExpired(time) {
+  // const expireAt = time + 3600 * 24 * 1000
+  const expireAt = time + 3600 * 1000 * 100 / 60;
+  return new Date().getTime() > expireAt
+}
+
+function utf8Encode(argString) {
+  // http://kevin.vanzonneveld.net
+  // +   original by: Webtoolkit.info (http://www.webtoolkit.info/)
+  // +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
+  // +   improved by: sowberry
+  // +    tweaked by: Jack
+  // +   bugfixed by: Onno Marsman
+  // +   improved by: Yves Sucaet
+  // +   bugfixed by: Onno Marsman
+  // +   bugfixed by: Ulrich
+  // +   bugfixed by: Rafal Kukawski
+  // +   improved by: kirilloid
+  // +   bugfixed by: kirilloid
+  // *     example 1: this.utf8Encode('Kevin van Zonneveld');
+  // *     returns 1: 'Kevin van Zonneveld'
+
+  if (argString === null || typeof argString === 'undefined') {
+    return ''
+  }
+
+  const string = argString + ''; // .replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  let utftext = '';
+  let start;
+  let end;
+  let stringl = 0;
+
+  start = end = 0;
+  stringl = string.length;
+  for (let n = 0; n < stringl; n++) {
+    let c1 = string.charCodeAt(n);
+    let enc = null;
+
+    if (c1 < 128) {
+      end++;
+    } else if (c1 > 127 && c1 < 2048) {
+      enc = String.fromCharCode((c1 >> 6) | 192, (c1 & 63) | 128);
+    } else if ((c1 & 0xf800) ^ (0xd800 > 0)) {
+      enc = String.fromCharCode(
+        (c1 >> 12) | 224,
+        ((c1 >> 6) & 63) | 128,
+        (c1 & 63) | 128
+      );
+    } else {
+      // surrogate pairs
+      if ((c1 & 0xfc00) ^ (0xd800 > 0)) {
+        throw new RangeError('Unmatched trail surrogate at ' + n)
+      }
+      const c2 = string.charCodeAt(++n);
+      if ((c2 & 0xfc00) ^ (0xdc00 > 0)) {
+        throw new RangeError('Unmatched lead surrogate at ' + (n - 1))
+      }
+      c1 = ((c1 & 0x3ff) << 10) + (c2 & 0x3ff) + 0x10000;
+      enc = String.fromCharCode(
+        (c1 >> 18) | 240,
+        ((c1 >> 12) & 63) | 128,
+        ((c1 >> 6) & 63) | 128,
+        (c1 & 63) | 128
+      );
+    }
+    if (enc !== null) {
+      if (end > start) {
+        utftext += string.slice(start, end);
+      }
+      utftext += enc;
+      start = end = n + 1;
+    }
+  }
+
+  if (end > start) {
+    utftext += string.slice(start, stringl);
+  }
+
+  return utftext
+}
+
+function base64Encode(data) {
+  // http://kevin.vanzonneveld.net
+  // +   original by: Tyler Akins (http://rumkin.com)
+  // +   improved by: Bayron Guevara
+  // +   improved by: Thunder.m
+  // +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
+  // +   bugfixed by: Pellentesque Malesuada
+  // +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
+  // -    depends on: this.utf8Encode
+  // *     example 1: this.base64Encode('Kevin van Zonneveld');
+  // *     returns 1: 'S2V2aW4gdmFuIFpvbm5ldmVsZA=='
+  // mozilla has this native
+  // - but breaks in 2.0.0.12!
+  // if (typeof this.window['atob'] == 'function') {
+  //    return atob(data);
+  // }
+  const b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  let o1;
+  let o2;
+  let o3;
+  let h1;
+  let h2;
+  let h3;
+  let h4;
+  let bits;
+  let i = 0;
+  let ac = 0;
+  let enc = '';
+  const tmp_arr = [];
+
+  if (!data) {
+    return data
+  }
+
+  data = utf8Encode(data + '');
+
+  do {
+    // pack three octets into four hexets
+    o1 = data.charCodeAt(i++);
+    o2 = data.charCodeAt(i++);
+    o3 = data.charCodeAt(i++);
+
+    bits = (o1 << 16) | (o2 << 8) | o3;
+
+    h1 = (bits >> 18) & 0x3f;
+    h2 = (bits >> 12) & 0x3f;
+    h3 = (bits >> 6) & 0x3f;
+    h4 = bits & 0x3f;
+
+    // use hexets to index into b64, and append result to encoded string
+    tmp_arr[ac++] =
+      b64.charAt(h1) + b64.charAt(h2) + b64.charAt(h3) + b64.charAt(h4);
+  } while (i < data.length)
+
+  enc = tmp_arr.join('');
+
+  switch (data.length % 3) {
+    case 1:
+      enc = enc.slice(0, -2) + '==';
+      break
+    case 2:
+      enc = enc.slice(0, -1) + '=';
+      break
+  }
+
+  return enc
+}
+
+// function base64Decode(data) {
+//   // http://kevin.vanzonneveld.net
+//   // +   original by: Tyler Akins (http://rumkin.com)
+//   // +   improved by: Thunder.m
+//   // +      input by: Aman Gupta
+//   // +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
+//   // +   bugfixed by: Onno Marsman
+//   // +   bugfixed by: Pellentesque Malesuada
+//   // +   improved by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
+//   // +      input by: Brett Zamir (http://brett-zamir.me)
+//   // +   bugfixed by: Kevin van Zonneveld (http://kevin.vanzonneveld.net)
+//   // *     example 1: base64_decode('S2V2aW4gdmFuIFpvbm5ldmVsZA==');
+//   // *     returns 1: 'Kevin van Zonneveld'
+//   // mozilla has this native
+//   // - but breaks in 2.0.0.12!
+//   // if (typeof this.window['atob'] == 'function') {
+//   //    return atob(data);
+//   // }
+//   let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+//   let o1, o2, o3, h1, h2, h3, h4, bits, i = 0,
+//     ac = 0,
+//     dec = "",
+//     tmp_arr = [];
+
+//   if (!data) {
+//     return data;
+//   }
+
+//   data += "";
+
+//   do { // unpack four hexets into three octets using index points in b64
+//     h1 = b64.indexOf(data.charAt(i++));
+//     h2 = b64.indexOf(data.charAt(i++));
+//     h3 = b64.indexOf(data.charAt(i++));
+//     h4 = b64.indexOf(data.charAt(i++));
+
+//     bits = h1 << 18 | h2 << 12 | h3 << 6 | h4;
+
+//     o1 = bits >> 16 & 0xff;
+//     o2 = bits >> 8 & 0xff;
+//     o3 = bits & 0xff;
+
+//     if (h3 === 64) {
+//       tmp_arr[ac++] = String.fromCharCode(o1);
+//     } else if (h4 === 64) {
+//       tmp_arr[ac++] = String.fromCharCode(o1, o2);
+//     } else {
+//       tmp_arr[ac++] = String.fromCharCode(o1, o2, o3);
+//     }
+//   } while (i < data.length);
+
+//   dec = tmp_arr.join("");
+
+//   return dec;
+// }
+
+function urlSafeBase64Encode(v) {
+  v = base64Encode(v);
+  return v.replace(/\//g, '_').replace(/\+/g, '-')
+}
+
+// export function urlSafeBase64Decode(v) {
+//   v = v.replace(/_/g, "/").replace(/-/g, "+");
+//   return base64Decode(v);
+// }
+
 logger.useDefaults({
   defaultLevel: logger.OFF,
   formatter(messages) {
@@ -1141,22 +1420,26 @@ logger.useDefaults({
 
 const fileManager = wx.getFileSystemManager();
 const readFileAsync = promisify(fileManager.readFile);
-const miniProgram = wx.getAccountInfoSync();
 const systemInfo = wx.getSystemInfoSync();
-const appId = miniProgram.appId;
-const MB = 1024 * 1024;
+
+// 清理过期的缓存
+clearExpiredLocalFileInfo();
 
 class Uploader {
   constructor(option = {}) {
-    if (option.verbose) logger.setLevel(logger.INFO);
+    // if (option.verbose) Logger.setLevel(Logger.INFO)
+    if (option.verbose) logger.setLevel(logger.TRACE);
     logger.debug('construct option ', option);
-    this.config = Object.assign(config, option);
+    // this.config = Object.assign(config, option)
+    this.config = {...config, ...option};
     this.emitter = new EventEmitter();
     this.totalSize = this.config.totalSize;
     this.chunkSize = this.config.chunkSize;
+    this.continueByMD5 = this.config.continueByMD5;
     this.tempFilePath = this.config.tempFilePath;
     this.totalChunks = Math.ceil(this.totalSize / this.chunkSize);
     this.maxLoadChunks = Math.floor(this.config.maxMemory / this.chunkSize);
+    this.isDirectUpload = this.config.forceDirect || this.totalSize < this.config.directChunkSize; // 直传：强制直传或者文件大小小于分片大小
     this._event();
   }
 
@@ -1168,73 +1451,6 @@ class Uploader {
   async upload() {
     this._reset();
 
-    logger.info('start generateIdentifier');
-    // step1: 计算 identifier
-    try {
-      logger.time('[Uploader] generateIdentifier');
-      if (this.config.testChunks) {
-        this.identifier = await this.computeMD5();
-      } else {
-        this.identifier = this.generateIdentifier();
-      }
-      logger.timeEnd('[Uploader] generateIdentifier');
-      logger.debug('generateIdentifier ', this.identifier);
-    } catch (error) {
-      this.handleFail({
-        errCode: 10002,
-        errMsg: error.message
-      });
-      return
-    }
-    logger.info('generateIdentifier end');
-    // step2: 获取已上传分片
-    if (this.config.testChunks && this.config.verifyUrl) {
-      logger.info('start verify uploaded chunks');
-      logger.time('[Uploader] verifyRequest');
-      const [verifyErr, verifyResp] = await awaitWrap(this.verifyRequest());
-      logger.timeEnd('[Uploader] verifyRequest');
-      logger.debug('verifyRequest', verifyErr, verifyResp);
-      if (verifyErr) {
-        this.handleFail({
-          errCode: 20001,
-          errMsg: verifyErr.errMsg
-        });
-        return
-      }
-      const {
-        needUpload,
-        uploadedChunks,
-      } = verifyResp.data;
-      logger.info('verify uploaded chunks end');
-      // 秒传逻辑
-      // 找不到合成的文件
-      if (!needUpload) {
-        this.progress = 100;
-        this.timeRemaining = 0;
-        this.dispatchProgress();
-        this.emit('success', {
-          errCode: 0,
-          ...verifyResp.data
-        });
-        this.emit('complete', {
-          errCode: 0,
-          ...verifyResp.data
-        });
-        return
-      // 分片齐全，但没有合并
-      } else if (uploadedChunks.length === this.totalChunks) {
-        this.progress = 100;
-        this.timeRemaining = 0;
-        this.dispatchProgress();
-        this.emit('uploadDone');
-        return
-      } else {
-        this.chunksIndexNeedRead = this.chunksIndexNeedRead.filter(v => !uploadedChunks.includes(v));
-        this.chunksIndexNeedSend = this.chunksIndexNeedSend.filter(v => !uploadedChunks.includes(v));
-        this.uploadedChunks = uploadedChunks.sort();
-      }
-    }
-
     this.chunksNeedSend = this.chunksIndexNeedSend.length;
     this.sizeNeedSend = this.chunksNeedSend * this.chunkSize;
     if (this.chunksIndexNeedSend.includes(this.totalChunks - 1)) {
@@ -1243,7 +1459,6 @@ class Uploader {
 
     logger.debug(`
       start upload
-        uploadedChunks: ${this.uploadedChunks},
         chunksQueue: ${this.chunksQueue},
         chunksIndexNeedRead: ${this.chunksIndexNeedRead},
         chunksNeedSend: ${this.chunksIndexNeedSend},
@@ -1252,7 +1467,7 @@ class Uploader {
 
     logger.info('start upload chunks');
     logger.time('[Uploader] uploadChunks');
-    // step3: 开始上传
+    // step1: 开始上传
     this.isUploading = true;
     this._upload();
   }
@@ -1262,7 +1477,8 @@ class Uploader {
       chunkRetryInterval,
       maxChunkRetries,
       successStatus,
-      failStatus
+      failStatus,
+      timeout
     } = this.config;
 
     let retries = maxChunkRetries;
@@ -1270,7 +1486,7 @@ class Uploader {
       const doRequest = () => {
         const task = wx.request({
           ...args,
-          timeout: this.config.timeout,
+          timeout,
           success: (res) => {
             const statusCode = res.statusCode;
 
@@ -1317,7 +1533,7 @@ class Uploader {
   }
 
   _event() {
-    // step4: 发送合并请求
+    // step2: 发送合并请求
     this.on('uploadDone', async () => {
       logger.timeEnd('[Uploader] uploadChunks');
       logger.info('upload chunks end');
@@ -1328,10 +1544,12 @@ class Uploader {
       logger.timeEnd('[Uploader] mergeRequest');
       logger.info('merge reqeust end');
       logger.debug('mergeRequest', mergeErr, mergeResp);
+      if (this.continueByMD5) removeLocalFileInfo(this.totalSize);
       if (mergeErr) {
         this.handleFail({
           errCode: 20003,
-          errrMsg: mergeErr.errMsg
+          errrMsg: mergeErr.errMsg,
+          errInfo: mergeErr
         });
         return
       }
@@ -1345,11 +1563,39 @@ class Uploader {
         ...mergeResp.data
       });
     });
+    // 直传：当文件大小小于分片大小
+    this.on('directUploadDone', async () => {
+      const [requestErr, request] = await awaitWrap(this.directUpload());
+      this.updateUploadSize(this.totalSize);
+      if (requestErr) {
+        this.handleFail({
+          errCode: 20003,
+          errrMsg: requestErr.errMsg,
+          errInfo: requestErr
+        });
+        return
+      }
+      logger.info('directUploadDone file success');
+      this.emit('success', {
+        errCode: 0,
+        ...request.data
+      });
+      this.emit('complete', {
+        errCode: 0,
+        ...request.data
+      });
+    });
   }
 
-  _upload() {
+  async _upload() {
     this.startUploadTime = Date.now();
     this._uploadedSize = 0;
+
+    // 直传
+    if (this.isDirectUpload) {
+      this.emit('directUploadDone');
+      return
+    }
 
     if (this.chunksQueue.length) {
       const maxConcurrency = this.config.maxConcurrency;
@@ -1359,6 +1605,54 @@ class Uploader {
     } else {
       this.readFileChunk();
     }
+  }
+
+  directUpload() {
+    const {
+      key, uphost, token, timeout, successStatus, failStatus, maxChunkRetries, chunkRetryInterval
+    } = this.config;
+    let retries = maxChunkRetries;
+    return new Promise((resolve, reject) => {
+      const doRequest = () => {
+        this.directTask = wx.uploadFile({
+          url: uphost,
+          filePath: this.tempFilePath,
+          name: 'file',
+          formData: {
+            key,
+            token
+          },
+          timeout,
+          success: (res) => {
+            console.log('uploadFile res', res, retries);
+            const statusCode = res.statusCode;
+            // 标示成功的返回码
+            if (successStatus.includes(statusCode)) {
+              resolve(res);
+            // 标示失败的返回码
+            } else if (failStatus.includes(statusCode)) {
+              reject(res);
+            } else if (retries > 0) {
+              setTimeout(() => {
+                this.emit('retry', {
+                  statusCode,
+                  url: this.tempFilePath
+                });
+                --retries;
+                doRequest();
+              }, chunkRetryInterval);
+            } else {
+              reject(res);
+            }
+          },
+          fail(error) {
+            reject(error);
+          }
+        });
+      };
+
+      doRequest();
+    })
   }
 
   updateUploadSize(currUploadSize) {
@@ -1386,6 +1680,12 @@ class Uploader {
   pause() {
     logger.info('** pause **');
     this.isUploading = false;
+
+    if (this.isDirectUpload) {
+      this.directTask.abort();
+      return
+    }
+
     const abortIndex = Object.keys(this.uploadTasks).map(v => v * 1);
     abortIndex.forEach(index => {
       this.chunksIndexNeedRead.push(index);
@@ -1407,22 +1707,22 @@ class Uploader {
   }
 
   _reset() {
+    // [0, 1, 2, 3, 4, 5, ...]，需要被读取的分片的序号数组
     this.chunksIndexNeedRead = Array.from(Array(this.totalChunks).keys());
     this.chunksIndexNeedSend = Array.from(Array(this.totalChunks).keys());
     this.chunksNeedSend = this.totalChunks;
     this.sizeNeedSend = this.totalSize;
-    this.identifier = '';
     this.chunksSend = 0;
     this.chunksQueue = [];
     this.uploadTasks = {};
-    this.pUploadList = [];
-    this.uploadedChunks = [];
     this.isUploading = false;
     this.isFail = false;
     this.progress = 0;
     this.uploadedSize = 0;
     this.averageSpeed = 0;
     this.timeRemaining = Number.POSITIVE_INFINITY;
+    this.ctxList = [];
+    this.localInfo = this.continueByMD5 ? getLocalFileInfo(this.totalSize) : null;
     this.dispatchProgress();
   }
 
@@ -1450,17 +1750,25 @@ class Uploader {
         length
       }).then(res => {
         const chunk = res.data;
+        let md5 = '';
+        if (this.continueByMD5) {
+          const t1 = Date.now();
+          md5 = computeMd5(chunk);
+          console.log('time ' + index, Date.now() - t1);
+        }
         this.chunksQueue.push({
           chunk,
           length,
-          index
+          index,
+          md5
         });
         this.uploadChunk();
         return null
       }).catch(e => {
         this.handleFail({
           errCode: 10001,
-          errMsg: e.errMsg
+          errMsg: e.errMsg,
+          errInfo: e
         });
       });
     }
@@ -1477,42 +1785,52 @@ class Uploader {
     const {
       chunk,
       index,
-      length
+      length,
+      md5
     } = this.chunksQueue.shift();
 
-    // 跳过已发送的分块
-    if (this.uploadedChunks.includes(index)) {
-      this.uploadChunk();
-      return
+    if (this.continueByMD5) {
+      // 通过文件size作为id来缓存上传部分分片后失败的文件
+      // 如果缓存中存在该文件，并且对比md5发现某些分片已经上传，则不再重复上传该分片
+      const info = this.localInfo[index];
+      const savedReusable = info && !isChunkExpired(info.time);
+      if (savedReusable && md5 === info.md5) {
+        this.ctxList[index] = {...info};
+        this.chunksSend++;
+        this.updateUploadSize(length);
+        // 所有分片发送完毕
+        if (this.chunksSend === this.chunksNeedSend) {
+          this.emit('uploadDone');
+        } else {
+          // 尝试继续加载文件
+          this.readFileChunk();
+          // 尝试继续发送下一条
+          this.uploadChunk();
+        }
+        return
+      }
     }
-    const {
-      uploadUrl,
-      query,
-      header
-    } = this.config;
-    const identifier = this.identifier;
-    const url = addParams(uploadUrl, {
-      ...query,
-      identifier,
-      index,
-      chunkSize: length,
-      fileName: this.config.fileName,
-      totalChunks: this.totalChunks,
-      totalSize: this.totalSize
-    });
+
     logger.debug(`uploadChunk index: ${index}, lenght ${length}`);
     logger.time(`[Uploader] uploadChunk index-${index}`);
+    const requestUrl = this.config.uphost + '/mkblk/' + length;
     this._requestAsync({
-      url,
+      url: requestUrl,
       data: chunk,
       header: {
-        ...header,
+        ...getAuthHeaders(this.config.token),
         'content-type': 'application/octet-stream'
       },
       method: 'POST',
     }, (task) => {
       this.uploadTasks[index] = task;
-    }).then(() => {
+    }).then((res) => {
+      this.ctxList[index] = {
+        time: new Date().getTime(),
+        ctx: res.data.ctx,
+        size: length,
+        md5
+      };
       this.chunksSend++;
       delete this.uploadTasks[index];
       this.updateUploadSize(length);
@@ -1526,6 +1844,7 @@ class Uploader {
       if (this.chunksSend === this.chunksNeedSend) {
         this.emit('uploadDone');
       }
+      if (this.continueByMD5) setLocalFileInfo(this.totalSize, this.ctxList);
       return null
     }).catch(res => {
       if (res.errMsg.includes('request:fail abort')) {
@@ -1533,7 +1852,8 @@ class Uploader {
       } else {
         this.handleFail({
           errCode: 20002,
-          errMsg: res.errMsg
+          errMsg: res.errMsg,
+          errInfo: res
         });
       }
     });
@@ -1551,87 +1871,41 @@ class Uploader {
     this.emitter.off(event, listenr);
   }
 
-  generateIdentifier() {
-    let identifier = '';
-    const generator = this.config.generateIdentifier;
-    if (isFunction(generator)) {
-      identifier = generator();
-    } else {
-      const uuid = `${appId}-${Date.now()}-${Math.random()}`;
-      identifier = sparkMd5.hash(uuid);
+  // 构造file上传url
+  createMkFileUrl() {
+    const {putExtra, key, uphost} = this.config;
+    let requestUrl = uphost + '/mkfile/' + this.totalSize;
+    if (key != null) {
+      requestUrl += '/key/' + urlSafeBase64Encode(key);
     }
-    return identifier
-  }
-
-  async computeMD5() {
-    const {
-      tempFilePath,
-      totalSize,
-      chunkSize
-    } = this;
-
-    // 文件比内存限制小时，保存分片
-    const isltMaxMemory = totalSize < this.config.maxMemory;
-    const sliceSize = isltMaxMemory ? chunkSize : 10 * MB;
-    const sliceNum = Math.ceil(totalSize / sliceSize);
-    const spark = new sparkMd5.ArrayBuffer();
-    for (let i = 0; i < sliceNum; i++) {
-      const position = i * sliceSize;
-      const length = Math.min(totalSize - position, sliceSize);
-      // eslint-disable-next-line no-await-in-loop
-      const [readFileErr, readFileResp] = await awaitWrap(readFileAsync({
-        filePath: tempFilePath,
-        position,
-        length
-      }));
-
-      if (readFileErr) {
-        spark.destroy();
-        throw (new Error(readFileErr.errMsg))
-      }
-
-      const chunk = readFileResp.data;
-      if (isltMaxMemory) {
-        this.chunksQueue.push({
-          chunk,
-          length,
-          index: i
-        });
-      }
-      spark.append(chunk);
+    // 由于没有file.type，因此不处理mimeType
+    // if (putExtra.mimeType) {
+    //   requestUrl += '/mimeType/' + urlSafeBase64Encode(file.type)
+    // }
+    const fname = putExtra.fname;
+    if (fname) {
+      requestUrl += '/fname/' + urlSafeBase64Encode(fname);
     }
-    this.chunksIndexNeedRead = [];
-    const identifier = spark.end();
-    spark.destroy();
-    return identifier
-  }
-
-  async verifyRequest() {
-    const {
-      verifyUrl,
-      fileName
-    } = this.config;
-    const verifyResp = await this._requestAsync({
-      url: verifyUrl,
-      data: {
-        fileName,
-        identifier: this.identifier
-      }
-    });
-    return verifyResp
+    if (putExtra.params) {
+      filterParams(putExtra.params).forEach(
+        item => (requestUrl += '/' + encodeURIComponent(item[0]) + '/' + urlSafeBase64Encode(item[1]))
+      );
+    }
+    return requestUrl
   }
 
   async mergeRequest() {
-    const {
-      mergeUrl,
-      fileName
-    } = this.config;
+    const requestUrL = this.createMkFileUrl();
+    const data = this.ctxList.map(value => value.ctx).join(',');
+
     const mergeResp = await this._requestAsync({
-      url: mergeUrl,
-      data: {
-        fileName,
-        identifier: this.identifier
-      }
+      url: requestUrL,
+      header: {
+        ...getAuthHeaders(this.config.token),
+        'content-type': 'text/plain'
+      },
+      data,
+      method: 'POST',
     });
     return mergeResp
   }

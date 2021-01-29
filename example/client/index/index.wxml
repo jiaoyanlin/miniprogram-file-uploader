@@ -1,5 +1,5 @@
 <view class="line">
-  <button bindtap="chooseVideo">选择视频</button>
+  <button bindtap="chooseImage">选择图片-分片</button>
 </view>
 <view class="line">
   <button bindtap="handlePause">暂停上传</button>
@@ -15,26 +15,14 @@
 </view>
 
 <view class="line">
- 是否计算文件 MD5  
- <switch 
-  checked="{{testChunks}}"
-  bindchange="onTestChunksChange"
->
-</switch>
+  <button bindtap="chooseImageDirect">选择图片-直传</button>
 </view>
+
 <view class="line">
-  分片大小（MB）
-  <slider
-    class="slider"
-    min="1"
-    max="10"
-    step="1"
-    value="5"
-    show-value
-    bindchange="onChunkSizeChange"
-  >
-  </slider>
+  <view>分片均速： {{aver1}}s/次 {{num1}}次</view>
+  <view>直传均速： {{aver2}}s/次 {{num2}}次</view>
 </view>
+
 <view class="line">
   上传进度：
   <progress 

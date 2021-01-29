@@ -4,6 +4,7 @@
   "description": "Uploader library for wechat miniprogram",
   "main": "dist/uploader.js",
   "scripts": {
+    "start": "npx rollup -c -w",
     "dev": "npm run server & npx rollup -c -w",
     "server": "node example/server/app.js",
     "build": "npx rollup -c",
